@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+import os, sys, json, threading, multiprocessing, subprocess
+from datetime import datetime
+from pathlib import Path
+from edge_impulse_linux.runner import ImpulseRunner
+
+class USBVoiceClassifier:
+    def __init__(self, model_path, output_queue, card_number=3):
+        self.model_path = model_path
+        self.output_queue = output_queue
+        self.runner = None
+        self.card_number = card_number
+    
+    def initialize(self):
+        try:
+            self.runner = ImpulseRunner(self.model_path)
+            self.runner.init()
+            print(f"[VOICE] ✓ Ready (Card {self.card_number})")
+            return True
+        except Exception as e:
+            print(f"[VOICE] ✗ Error: {e}")
+            self.output_queue.put({"module": "voice", "error": str(e)})
+            return False
+    
+    def run(self):
+        if not self.initialize():
+            return
+        try:
+            sample_count = 0
+            for res, audio in self.runner.classifier(str(Path.home())):
+                sample_count += 1
+                if res and "result" in res and "classification" in res["result"]:
+                    predictions = res["result"]["classification"]
+                    top_class = max(predictions.items(), key=lambda x: x)
+                    output_data = {
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "module": "voice",
+                        "class": top_class,
+                        "confidence": float(top_class),
+                        "all_predictions": {k: float(v) for k, v in predictions.items()}
+                    }
+                    self.output_queue.put(output_data)
+                    print(f"[VOICE] Sample #{sample_count}: {top_class} ({top_class:.1%})")
+        except KeyboardInterrupt:
+            print("[VOICE] Stopped")
+        except Exception as e:
+            print(f"[VOICE] Error: {e}")
+        finally:
+            if self.runner:
+                try:
+                    self.runner.stop()
+                except:
+                    pass
+
+class USBImageClassifier:
+    def __init__(self, model_path, output_queue, camera_index=0):
+        self.model_path = model_path
+        self.output_queue = output_queue
+        self.runner = None
+        self.camera_index = camera_index
+    
+    def initialize(self):
+        try:
+            self.runner = ImpulseRunner(self.model_path)
+            self.runner.init()
+            print(f"[IMAGE] ✓ Ready (/dev/video{self.camera_index})")
+            return True
+        except Exception as e:
+            print(f"[IMAGE] ✗ Error: {e}")
+            self.output_queue.put({"module": "image", "error": str(e)})
+            return False
+    
+    def run(self):
+        if not self.initialize():
+            return
+        try:
+            frame_count = 0
+            for res, img in self.runner.classifier():
+                frame_count += 1
+                if res and "result" in res and "classification" in res["result"]:
+                    predictions = res["result"]["classification"]
+                    top_class = max(predictions.items(), key=lambda x: x)
+                    output_data = {
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "module": "image",
+                        "class": top_class,
+                        "confidence": float(top_class),
+                        "all_predictions": {k: float(v) for k, v in predictions.items()}
+                    }
+                    self.output_queue.put(output_data)
+                    if frame_count % 3 == 0:
+                        print(f"[IMAGE] Frame #{frame_count}: {top_class} ({top_class:.1%})")
+        except KeyboardInterrupt:
+            print("[IMAGE] Stopped")
+        except Exception as e:
+            print(f"[IMAGE] Error: {e}")
+        finally:
+            if self.runner:
+                try:
+                    self.runner.stop()
+                except:
+                    pass
+
+class DualClassifierManager:
+    def __init__(self, voice_model_path, image_model_path, usb_mic_card=1, usb_cam_index=0, log_file=None):
+        self.voice_model_path = voice_model_path
+        self.image_model_path = image_model_path
+        self.usb_mic_card = usb_mic_card
+        self.usb_cam_index = usb_cam_index
+        self.log_file = log_file or "classification_log.json"
+        self.output_queue = multiprocessing.Queue()
+    
+    def run(self):
+        print("\n" + "="*60)
+        print("DUAL CLASSIFIER: Voice (USB Mic) + Image (USB Webcam)")
+        print("="*60)
+        
+        if not os.path.exists(self.voice_model_path) or not os.path.exists(self.image_model_path):
+            print("✗ Models not found")
+            return
+        
+        voice_proc = multiprocessing.Process(target=self._run_voice, args=(self.usb_mic_card,))
+        image_proc = multiprocessing.Process(target=self._run_image, args=(self.usb_cam_index,))
+        logger_thread = threading.Thread(target=self._collect_logs, daemon=True)
+        
+        voice_proc.start()
+        image_proc.start()
+        logger_thread.start()
+        
+        print("✓ Both classifiers started\nPress Ctrl+C to stop\n" + "="*60 + "\n")
+        
+        try:
+            voice_proc.join()
+            image_proc.join()
+        except KeyboardInterrupt:
+            print("\nShutting down...")
+            voice_proc.terminate()
+            image_proc.terminate()
+            voice_proc.join(timeout=5)
+            image_proc.join(timeout=5)
+    
+    def _run_voice(self, card_number):
+        classifier = USBVoiceClassifier(self.voice_model_path, self.output_queue, card_number=card_number)
+        classifier.run()
+    
+    def _run_image(self, camera_index):
+        classifier = USBImageClassifier(self.image_model_path, self.output_queue, camera_index=camera_index)
+        classifier.run()
+    
+    def _collect_logs(self):
+        results = []
+        try:
+            while True:
+                try:
+                    result = self.output_queue.get(timeout=0.5)
+                    if "error" not in result:
+                        results.append(result)
+                        print(f"[{result['module'].upper():5}] {result['timestamp']} | {result['class']:12} | {result['confidence']:.1%}")
+                except:
+                    pass
+        except KeyboardInterrupt:
+            pass
+        finally:
+            if results:
+                with open(self.log_file, 'w') as f:
+                    json.dump(results, f, indent=2)
+
+def main():
+    script_dir = Path(__file__).parent.absolute()
+    voice_model = script_dir / "voice_model" / "voice_model.eim"
+    image_model = script_dir / "image_model" / "image_model.eim"
+    log_file = script_dir / "logs" / "classification_log.json"
+    (script_dir / "logs").mkdir(exist_ok=True)
+    
+    manager = DualClassifierManager(
+        voice_model_path=str(voice_model),
+        image_model_path=str(image_model),
+        usb_mic_card=3,        # ← CHANGE if your card number is different
+        usb_cam_index=0,       # ← CHANGE if using /dev/video1 or /dev/video2
+        log_file=str(log_file)
+    )
+    manager.run()
+
+if __name__ == "__main__":
+    main()
